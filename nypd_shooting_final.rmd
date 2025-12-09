@@ -1,0 +1,327 @@
+---
+title: "NYPD Shooting Dataset"
+author: "Z. Hall"
+date: "2025-12-8"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(broom)
+library(pROC)
+
+```
+
+# Import
+
+```{r import}
+nypd_url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+nypd_shooting <- read_csv(nypd_url)
+
+```
+
+# Cleaning
+
+```{r cleaning}
+
+nypd_shooting_clean <- nypd_shooting %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE)) %>%
+
+  # missing values
+  mutate(
+    PERP_AGE_GROUP = case_when(
+      PERP_AGE_GROUP %in% c("(null)", "UNKNOWN") ~ NA_character_,
+      TRUE ~ PERP_AGE_GROUP
+    ),
+    PERP_SEX = case_when(
+      PERP_SEX %in% c("(null)", "U") ~ NA_character_,
+      TRUE ~ PERP_SEX
+    ),
+    PERP_RACE = case_when(
+      PERP_RACE %in% c("(null)", "UNKNOWN") ~ NA_character_,
+      TRUE ~ PERP_RACE
+    )
+  ) %>%
+
+  # Time of Day
+  mutate(
+    hour_of_day = hour(OCCUR_TIME),
+    time_period = case_when(
+      hour_of_day >= 6 & hour_of_day < 12 ~ "Morning",
+      hour_of_day >= 12 & hour_of_day < 18 ~ "Afternoon",
+      hour_of_day >= 18 & hour_of_day < 24 ~ "Evening",
+      TRUE ~ "Night"
+    ),
+    # murder flag to factor
+    is_fatal = factor(STATISTICAL_MURDER_FLAG, labels = c("Non-Fatal", "Fatal"))
+  )
+
+```
+
+
+# Visualization: Precinct Boundary Maps
+
+```{r precinct_maps}
+
+# Shooting counts by precinct
+shooting_by_precinct <- nypd_shooting_clean %>%
+  group_by(PRECINCT) %>%
+  summarise(
+    total_shootings = n(),
+    total_murders = sum(STATISTICAL_MURDER_FLAG, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+precinct_url <- "https://services5.arcgis.com/GfwWNkhOj9bNBqoJ/arcgis/rest/services/NYC_Police_Precincts/FeatureServer/0/query?where=1=1&outFields=*&outSR=4326&f=pgeojson"
+precincts_sf <- st_read(precinct_url, quiet = TRUE)
+
+precincts_sf <- precincts_sf %>%
+  rename(PRECINCT = Precinct) %>%
+  left_join(shooting_by_precinct, by = "PRECINCT") %>%
+  mutate(
+    total_shootings = replace_na(total_shootings, 0),
+    total_murders = replace_na(total_murders, 0)
+  )
+
+pal_murders <- colorNumeric(
+  palette = c("#FEE5D9", "#FCAE91", "#FB6A4A", "#DE2D26", "#A50F15"),
+  domain = precincts_sf$total_murders
+)
+
+pal_shootings <- colorNumeric(
+  palette = c("#DEEBF7", "#9ECAE1", "#4292C6", "#2171B5", "#08519C"),
+  domain = precincts_sf$total_shootings
+)
+
+# Total Shootings by Precinct Boundaries
+map_shootings <- leaflet(precincts_sf) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_shootings(total_shootings),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 2,
+    opacity = 1,
+    highlightOptions = highlightOptions(
+      weight = 3,
+      color = "#666",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    label = ~paste0(
+      "Precinct ", PRECINCT, ": ",
+      total_shootings, " shootings"
+    ),
+    popup = ~paste0(
+      "<strong>Precinct ", PRECINCT, "</strong><br/>",
+      "Total Shootings: ", total_shootings
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = pal_shootings,
+    values = ~total_shootings,
+    title = "Total Shootings",
+    opacity = 1
+  ) %>%
+  setView(lng = -73.95, lat = 40.70, zoom = 10)
+
+# Total Murders by Precinct Boundaries
+map_murders <- leaflet(precincts_sf) %>%
+  addTiles() %>%
+  addPolygons(
+    fillColor = ~pal_murders(total_murders),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 2,
+    opacity = 1,
+    highlightOptions = highlightOptions(
+      weight = 3,
+      color = "#666",
+      fillOpacity = 0.9,
+      bringToFront = TRUE
+    ),
+    label = ~paste0(
+      "Precinct ", PRECINCT, ": ",
+      total_murders, " murders"
+    ),
+    popup = ~paste0(
+      "<strong>Precinct ", PRECINCT, "</strong><br/>",
+      "Total Murders: ", total_murders
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    pal = pal_murders,
+    values = ~total_murders,
+    title = "Total Murders",
+    opacity = 1
+  ) %>%
+  setView(lng = -73.95, lat = 40.70, zoom = 10)
+
+# Visuals
+map_shootings
+map_murders
+```
+
+# Visualizations: Quick Fatality Exploration
+
+```{r fatality analysis}
+# Quick Fatality Stats
+cat("Overall fatality rate:",
+    round(mean(nypd_shooting_clean$STATISTICAL_MURDER_FLAG) * 100, 1), "%\n\n")
+
+fatality_by_boro <- nypd_shooting_clean %>%
+  group_by(BORO) %>%
+  summarise(
+    total = n(),
+    fatal = sum(STATISTICAL_MURDER_FLAG),
+    fatality_rate = round(fatal / total * 100, 1)
+  ) %>%
+  arrange(desc(fatality_rate))
+
+print(fatality_by_boro)
+
+fatality_by_time <- nypd_shooting_clean %>%
+  group_by(time_period) %>%
+  summarise(
+    total = n(),
+    fatal = sum(STATISTICAL_MURDER_FLAG),
+    fatality_rate = round(fatal / total * 100, 1)
+  ) %>%
+  arrange(desc(fatality_rate))
+
+print(fatality_by_time)
+
+# Borough fatality
+ggplot(nypd_shooting_clean, aes(x = BORO, fill = is_fatal)) +
+  geom_bar(color = "white", linewidth = 0.5) +
+  labs(
+    title = "Distribution of Shootings by Borough",
+    x = "Borough",
+    y = "Number of Shootings",
+    fill = "Outcome"
+  ) +
+  scale_fill_manual(values = c("Non-Fatal" = "steelblue", "Fatal" = "red")) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+# Time of Day fatality
+ggplot(nypd_shooting_clean, aes(x = time_period, fill = is_fatal)) +
+  geom_bar(color = "white", linewidth = 0.5) +
+  labs(
+    title = "Distribution of Shootings by Time of Day",
+    x = "Time Period",
+    y = "Number of Shootings",
+    fill = "Outcome"
+  ) +
+  scale_fill_manual(values = c("Non-Fatal" = "steelblue", "Fatal" = "red")) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+```             
+
+
+# Predicting Fatal Shootings
+
+```{r risk_analysis}
+
+# Risk Model Prep
+model_data <- nypd_shooting_clean %>%
+  filter(
+    !is.na(BORO),
+    !is.na(VIC_AGE_GROUP),
+    !is.na(VIC_SEX),
+    !is.na(is_fatal),
+    !VIC_AGE_GROUP %in% c("1022", "UNKNOWN"),
+    VIC_SEX != "U"
+  ) %>%
+  select(is_fatal, BORO, time_period, VIC_AGE_GROUP, VIC_SEX, LOCATION_DESC)
+
+model <- glm(is_fatal ~ BORO + time_period + VIC_AGE_GROUP + VIC_SEX,
+             data = model_data,
+             family = binomial(link = "logit"))
+
+summary(model)
+
+# Odds ratios
+model_results <- tidy(model, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(abs(estimate - 1))) %>%
+  mutate(
+    odds_ratio = round(estimate, 3),
+    p_value = format.pval(p.value, digits = 3)
+  ) %>%
+  select(term, odds_ratio, p_value)
+
+print(model_results, n = 20)
+
+# Model performance
+predictions <- predict(model, type = "response")
+roc_obj <- roc(model_data$is_fatal, predictions, quiet = TRUE)
+
+cat("\n\nModel Performance:\nAUC:", round(auc(roc_obj), 3), "\n")
+
+```
+
+# Fatality Risk by Age
+
+```{r age_fatality_plot}
+
+age_odds <- tidy(model, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(grepl("VIC_AGE_GROUP", term)) %>%
+  mutate(
+    age_group = gsub("VIC_AGE_GROUP", "", term),
+    age_group = factor(age_group, levels = c("18-24", "25-44", "45-64", "65+"))
+  ) %>%
+  select(age_group, odds_ratio = estimate, ci_lower = conf.low, ci_upper = conf.high)
+
+baseline <- data.frame(
+  age_group = factor("<18", levels = c("<18", "18-24", "25-44", "45-64", "65+")),
+  odds_ratio = 1.0,
+  ci_lower = 1.0,
+  ci_upper = 1.0
+)
+
+age_odds_full <- bind_rows(baseline, age_odds) %>%
+  mutate(
+    age_group = factor(age_group, levels = c("<18", "18-24", "25-44", "45-64", "65+")),
+    age_numeric = as.numeric(age_group)
+  )
+
+# Plot
+ggplot(age_odds_full, aes(x = age_numeric, y = odds_ratio)) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper),
+              fill = "gray60", alpha = 0.3) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  geom_text(aes(label = round(odds_ratio, 2)),
+            vjust = -1.2, hjust = 0.5, size = 3.5, fontface = "bold") +
+  scale_x_continuous(
+    breaks = 1:5,
+    labels = c("<18", "18-24", "25-44", "45-64", "65+")
+  ) +
+  labs(
+    title = "Odds of Shootings Resulting in Fatality Increase with Victim Age",
+    subtitle = "Odds ratios relative to victims under 18 \nShaded area represents 95% confidence interval",
+    x = "Victim Age Group",
+    y = "Odds Ratio relative to <18 years old"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.text.x = element_text(size = 11),
+    axis.text.y = element_text(size = 11)
+  ) +
+  ylim(0, max(age_odds_full$ci_upper) * 1.15)
+
+```
